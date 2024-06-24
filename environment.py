@@ -5,7 +5,7 @@ import pygame
 from pygame import gfxdraw
 
 class InvertedDoublePendulumEnv(gym.Env):
-    def __init__(self, gravity=9.8, friction=0.1, done_limit=100):
+    def __init__(self, gravity=0.1, friction=0.1, done_limit=5):
         super(InvertedDoublePendulumEnv, self).__init__()
         self.done_limit = done_limit
         self.gravity = gravity
@@ -13,6 +13,12 @@ class InvertedDoublePendulumEnv(gym.Env):
 
         self.dt = 0.02  # time step
         self.max_force = 10.0  # maximum force that can be applied
+
+        # Pendulum lengths and masses
+        self.m1 = 1.0  # mass of first pendulum
+        self.m2 = 1.0  # mass of second pendulum
+        self.l1 = 1.0  # length of first pendulum
+        self.l2 = 1.0  # length of second pendulum
 
         # Define action and observation space
         self.action_space = spaces.Box(low=-self.max_force, high=self.max_force, shape=(1,), dtype=np.float32)
@@ -46,19 +52,35 @@ class InvertedDoublePendulumEnv(gym.Env):
         # Apply the action
         force = action[0]
 
-        # Simplified physics for the double inverted pendulum
-        # This part should include the actual physics equations which define the system dynamics
-        # For simplicity, we are using a placeholder
-        xacc = force - self.friction * x_dot
-        theta1acc = self.gravity * np.sin(theta1) - self.friction * theta1_dot
-        theta2acc = self.gravity * np.sin(theta2) - self.friction * theta2_dot
+        # Physics parameters
+        g = self.gravity
+        m1 = self.m1
+        m2 = self.m2
+        l1 = self.l1
+        l2 = self.l2
+
+        # Common terms
+        cos_theta1_theta2 = np.cos(theta1 - theta2)
+        sin_theta1_theta2 = np.sin(theta1 - theta2)
+
+        # Equations of motion derived from Lagrangian mechanics
+        num1 = (force + m1 * l1 * theta1_dot**2 * sin_theta1_theta2 + m2 * l2 * theta2_dot**2 * sin_theta1_theta2) * (m1 + m2)
+        num2 = m2 * l2 * theta2_dot**2 * sin_theta1_theta2 - (m1 + m2) * g * np.sin(theta1)
+        den = (m1 + m2) * (m1 + m2 * (1 - cos_theta1_theta2**2))
+        theta1_acc = (num1 - num2 * cos_theta1_theta2) / (l1 * den)
+
+        num3 = (m1 + m2) * (force + m1 * l1 * theta1_dot**2 * sin_theta1_theta2 + m2 * l2 * theta2_dot**2 * sin_theta1_theta2)
+        num4 = (m1 + m2) * g * np.sin(theta2) - l1 * theta1_dot**2 * sin_theta1_theta2
+        theta2_acc = (num4 - num3 * cos_theta1_theta2) / (l2 * den)
+
+        x_acc = (force + m1 * l1 * theta1_dot**2 * sin_theta1_theta2 + m2 * l2 * theta2_dot**2 * sin_theta1_theta2) / (m1 + m2)
 
         # Update the state using Euler's method
-        x_dot += self.dt * xacc
+        x_dot += self.dt * x_acc
         x += self.dt * x_dot
-        theta1_dot += self.dt * theta1acc
+        theta1_dot += self.dt * theta1_acc
         theta1 += self.dt * theta1_dot
-        theta2_dot += self.dt * theta2acc
+        theta2_dot += self.dt * theta2_acc
         theta2 += self.dt * theta2_dot
 
         self.state = (x, x_dot, theta1, theta1_dot, theta2, theta2_dot)
@@ -66,8 +88,6 @@ class InvertedDoublePendulumEnv(gym.Env):
         # Check if the episode is done
         done = bool(
             x < -self.done_limit or x > self.done_limit  # Cart position limits
-            # or theta1 < -np.pi/2 or theta1 > np.pi/2  # Pendulum 1 angle limits
-            # or theta2 < -np.pi/2 or theta2 > np.pi/2  # Pendulum 2 angle limits
         )
 
         # Calculate the reward
@@ -113,3 +133,16 @@ class InvertedDoublePendulumEnv(gym.Env):
         if self.screen is not None:
             pygame.quit()
             self.screen = None
+
+# Test the environment
+if __name__ == "__main__":
+    env = InvertedDoublePendulumEnv()
+    obs = env.reset()
+    for _ in range(1000):
+        action = env.action_space.sample()  # Random action
+        obs, reward, done, info = env.step(action)
+        env.render()
+        if done:
+            obs = env.reset()
+    env.close()
+
