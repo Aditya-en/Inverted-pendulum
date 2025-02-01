@@ -1,148 +1,218 @@
-import gym
-from gym import spaces
-import numpy as np
 import pygame
-from pygame import gfxdraw
+import math
+import numpy as np
 
-class InvertedDoublePendulumEnv(gym.Env):
-    def __init__(self, gravity=0.1, friction=0.1, done_limit=5):
-        super(InvertedDoublePendulumEnv, self).__init__()
-        self.done_limit = done_limit
-        self.gravity = gravity
-        self.friction = friction
+# -----------------------------
+# Simulation parameters
+# -----------------------------
+# Screen parameters
+WIDTH, HEIGHT = 1000, 600
 
-        self.dt = 0.02  # time step
-        self.max_force = 10.0  # maximum force that can be applied
+# Physical parameters
+M = 1000.0    # mass of the cart
+m1 = 40.0     # mass of the first pendulum bob
+m2 = 40.0     # mass of the second pendulum bob
+L1 = 200.0    # length of the first pendulum rod (in pixels)
+L2 = 200.0    # length of the second pendulum rod (in pixels)
+g = 9.81      # gravitational acceleration
 
-        # Pendulum lengths and masses
-        self.m1 = 1.0  # mass of first pendulum
-        self.m2 = 1.0  # mass of second pendulum
-        self.l1 = 1.0  # length of first pendulum
-        self.l2 = 1.0  # length of second pendulum
+# Damping coefficients (tune these to change the dissipation rate)
+b_cart = 100.0      # damping coefficient for cart velocity
+b_theta1 = 80000.0     # damping coefficient for first pendulum angular velocity
+b_theta2 = 80000.0     # damping coefficient for second pendulum angular velocity
 
-        # Define action and observation space
-        self.action_space = spaces.Box(low=-self.max_force, high=self.max_force, shape=(1,), dtype=np.float32)
-        
-        # The observation space includes the cart position, velocities, and angles of the two pendulums
-        high = np.array([np.finfo(np.float32).max]*6, dtype=np.float32)
-        self.observation_space = spaces.Box(low=-high, high=high, dtype=np.float32)
+# Integration parameters
+dt = 0.02     # simulation time step
 
-        # Initialize state
-        self.state = None
+# Force limits (agent action)
+FORCE_MAG = 10000.0  # magnitude of force applied when key is pressed
 
-        # Rendering
-        self.screen = None
-        self.screen_width = 800
-        self.screen_height = 600
-        self.cart_width = 50
-        self.cart_height = 30
-        self.pole_length = 150
-        self.cart_y = self.screen_height / 2
-        self.clock = None
+# -----------------------------
+# Dynamics Functions
+# -----------------------------
+def dynamics(state, force):
+    """
+    Compute the state derivative for a cart with a double pendulum including damping.
+    
+    The state vector is:
+      state = [x, x_dot, theta1, theta1_dot, theta2, theta2_dot]
+      
+    where:
+      x          : horizontal position of the cart
+      theta1   : angle of the first pendulum (from vertical, positive clockwise)
+      theta2   : angle of the second pendulum (from vertical, positive clockwise)
+      
+    The damping is added as extra terms proportional to the velocities.
+    """
+    # Unpack state
+    x, x_dot, theta1, theta1_dot, theta2, theta2_dot = state
 
-    def reset(self):
-        # Initialize the state to a small random value
-        self.state = np.random.uniform(low=-0.05, high=0.05, size=(6,))
-        return self.state
+    # Precompute sines and cosines
+    s1 = math.sin(theta1)
+    c1 = math.cos(theta1)
+    s2 = math.sin(theta2)
+    c2 = math.cos(theta2)
+    s12 = math.sin(theta1 - theta2)
+    c12 = math.cos(theta1 - theta2)
 
-    def step(self, action):
-        # Unpack the state
-        x, x_dot, theta1, theta1_dot, theta2, theta2_dot = self.state
+    # --- Construct the mass matrix M_mat and right-hand side vector b ---
+    # Generalized coordinates: q = [x, theta1, theta2]
+    # Mass matrix components:
+    M11 = M + m1 + m2
+    M12 = (m1 + m2) * L1 * c1
+    M13 = m2 * L2 * c2
 
-        # Apply the action
-        force = action[0]
+    M21 = M12
+    M22 = (m1 + m2) * (L1 ** 2)
+    M23 = m2 * L1 * L2 * c12
 
-        # Physics parameters
-        g = self.gravity
-        m1 = self.m1
-        m2 = self.m2
-        l1 = self.l1
-        l2 = self.l2
+    M31 = M13
+    M32 = M23
+    M33 = m2 * (L2 ** 2)
 
-        # Common terms
-        cos_theta1_theta2 = np.cos(theta1 - theta2)
-        sin_theta1_theta2 = np.sin(theta1 - theta2)
+    M_mat = np.array([
+        [M11, M12, M13],
+        [M21, M22, M23],
+        [M31, M32, M33]
+    ])
 
-        # Equations of motion derived from Lagrangian mechanics
-        num1 = (force + m1 * l1 * theta1_dot**2 * sin_theta1_theta2 + m2 * l2 * theta2_dot**2 * sin_theta1_theta2) * (m1 + m2)
-        num2 = m2 * l2 * theta2_dot**2 * sin_theta1_theta2 - (m1 + m2) * g * np.sin(theta1)
-        den = (m1 + m2) * (m1 + m2 * (1 - cos_theta1_theta2**2))
-        theta1_acc = (num1 - num2 * cos_theta1_theta2) / (l1 * den)
+    # Original forcing terms from Lagrangian formulation:
+    # Note: The terms involving squared angular velocities are due to the nonlinear dynamics.
+    b1 = force - (m1 + m2) * L1 * s1 * (theta1_dot ** 2) - m2 * L2 * s2 * (theta2_dot ** 2)
+    b2 = - m2 * L1 * L2 * s12 * (theta2_dot ** 2) - (m1 + m2) * g * L1 * s1
+    b3 = m2 * L1 * L2 * s12 * (theta1_dot ** 2) - m2 * g * L2 * s2
 
-        num3 = (m1 + m2) * (force + m1 * l1 * theta1_dot**2 * sin_theta1_theta2 + m2 * l2 * theta2_dot**2 * sin_theta1_theta2)
-        num4 = (m1 + m2) * g * np.sin(theta2) - l1 * theta1_dot**2 * sin_theta1_theta2
-        theta2_acc = (num4 - num3 * cos_theta1_theta2) / (l2 * den)
+    # --- Add damping contributions ---
+    # For the cart: a friction force proportional to the velocity (x_dot)
+    b1 -= b_cart * x_dot
+    # For the pendulums: damping torques proportional to the angular velocities
+    b2 -= b_theta1 * theta1_dot
+    b3 -= b_theta2 * theta2_dot
 
-        x_acc = (force + m1 * l1 * theta1_dot**2 * sin_theta1_theta2 + m2 * l2 * theta2_dot**2 * sin_theta1_theta2) / (m1 + m2)
+    b_vec = np.array([b1, b2, b3])
 
-        # Update the state using Euler's method
-        x_dot += self.dt * x_acc
-        x += self.dt * x_dot
-        theta1_dot += self.dt * theta1_acc
-        theta1 += self.dt * theta1_dot
-        theta2_dot += self.dt * theta2_acc
-        theta2 += self.dt * theta2_dot
+    # Solve for the generalized accelerations: q_ddot = [x_ddot, theta1_ddot, theta2_ddot]
+    try:
+        q_ddot = np.linalg.solve(M_mat, b_vec)
+    except np.linalg.LinAlgError:
+        q_ddot = np.zeros(3)
 
-        self.state = (x, x_dot, theta1, theta1_dot, theta2, theta2_dot)
+    x_ddot, theta1_ddot, theta2_ddot = q_ddot
 
-        # Check if the episode is done
-        done = bool(
-            x < -self.done_limit or x > self.done_limit  # Cart position limits
-        )
+    return np.array([x_dot, x_ddot, theta1_dot, theta1_ddot, theta2_dot, theta2_ddot])
 
-        # Calculate the reward
-        reward = 1.0 if not done else 0.0
+def rk4_step(state, force, dt):
+    """Perform one RK4 integration step with given control force."""
+    k1 = dynamics(state, force)
+    k2 = dynamics(state + dt/2 * k1, force)
+    k3 = dynamics(state + dt/2 * k2, force)
+    k4 = dynamics(state + dt * k3, force)
+    new_state = state + (dt/6) * (k1 + 2*k2 + 2*k3 + k4)
+    return new_state
 
-        return np.array(self.state), reward, done, {}
+# -----------------------------
+# Pygame Rendering Functions
+# -----------------------------
+def draw_system(screen, state):
+    """
+    Draw the cart, pendulums, and rail so that the system appears smaller
+    and the rail is vertically centered. The cart's horizontal position
+    reflects its simulation state so that it can move along the rail.
+    """
+    # Clear screen
+    screen.fill((255, 255, 255))
+    
+    # --- Drawing parameters ---
+    scale = 0.5  # Scale factor to shrink the system
+    rail_y = HEIGHT // 2  # Place the rail at the vertical center
+    
+    # Unpack the simulation state.
+    # state = [x, x_dot, theta1, theta1_dot, theta2, theta2_dot]
+    x, _, theta1, _, theta2, _ = state
 
-    def render(self, mode='human'):
-        if self.screen is None:
-            pygame.init()
-            self.screen = pygame.display.set_mode((self.screen_width, self.screen_height))
-            pygame.display.set_caption("Inverted Double Pendulum")
-            self.clock = pygame.time.Clock()
+    # Compute the cart's horizontal position:
+    # We use the simulation's x (scaled) added to the horizontal center of the screen.
+    cart_x = WIDTH // 2 + int(x * scale)
+    # Place the cart slightly above the rail.
+    cart_y = rail_y - int(20 * scale)
+    
+    # --- Draw the rail ---
+    # (Here the rail is drawn fixed in screen coordinates.)
+    pygame.draw.line(screen, (0, 0, 0), (0, rail_y), (WIDTH, rail_y), 4)
+    
+    # --- Draw the cart ---
+    cart_width, cart_height = 100 * scale, 40 * scale  # Scaled dimensions
+    cart_rect = pygame.Rect(0, 0, cart_width, cart_height)
+    cart_rect.center = (cart_x, cart_y)
+    pygame.draw.rect(screen, (0, 128, 255), cart_rect)
+    
+    # --- Draw the pendulums ---
+    # The pivot point for the pendulums is at the top-center of the cart.
+    pivot = (cart_x, cart_y - cart_height // 2)
+    
+    # Use scaled lengths for drawing the pendulum rods.
+    draw_L1 = L1 * scale
+    draw_L2 = L2 * scale
 
+    # Compute the positions of the pendulum bobs.
+    # Note: Since y increases downward on the screen, we add to the y-coordinate.
+    x1 = pivot[0] + draw_L1 * math.sin(theta1)
+    y1 = pivot[1] + draw_L1 * math.cos(theta1)
+    x2 = x1 + draw_L2 * math.sin(theta2)
+    y2 = y1 + draw_L2 * math.cos(theta2)
+    
+    # Draw the rods (lines connecting the pivot to the first bob, and the first bob to the second bob)
+    pygame.draw.line(screen, (0, 0, 0), pivot, (x1, y1), 3)
+    pygame.draw.line(screen, (0, 0, 0), (x1, y1), (x2, y2), 3)
+    
+    # Draw the pendulum bobs as circles (scaling their size too)
+    bob_radius = int(20 * scale)
+    pygame.draw.circle(screen, (255, 0, 0), (int(x1), int(y1)), bob_radius)
+    pygame.draw.circle(screen, (0, 255, 0), (int(x2), int(y2)), bob_radius)
+    
+    pygame.display.flip()
+
+
+# -----------------------------
+# Main Loop
+# -----------------------------
+def main():
+    pygame.init()
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    pygame.display.set_caption("Double Pendulum on a Cart with Damping (RL Environment)")
+    clock = pygame.time.Clock()
+    
+    # Initial state:
+    # x, x_dot, theta1, theta1_dot, theta2, theta2_dot
+    # For the pendulums, an initial angle away from the bottom (0 radians) is used.
+    state = np.array([0.0, 0.0, math.pi/2, 0.0, math.pi/2, 0.0])
+    
+    running = True
+    while running:
+        # --- Handle events and set the control force ---
+        force = 0.0
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                pygame.quit()
+                running = False
+        
+        # Use key presses as a proxy for the RL agent's action:
+        keys = pygame.key.get_pressed()
+        if keys[pygame.K_LEFT]:
+            force = -FORCE_MAG
+        elif keys[pygame.K_RIGHT]:
+            force = FORCE_MAG
+        
+        # --- Update dynamics ---
+        # For better numerical stability, perform several RK4 steps per frame.
+        steps_per_frame = 5
+        for _ in range(steps_per_frame):
+            state = rk4_step(state, force, dt)
+        
+        # --- Render ---
+        draw_system(screen, state)
+        clock.tick(60)
+    
+    pygame.quit()
 
-        self.screen.fill((255, 255, 255))
-
-        x, _, theta1, _, theta2, _ = self.state
-
-        # Convert state to screen coordinates
-        cart_x = self.screen_width / 2 + x * 100
-        pole1_end_x = cart_x + self.pole_length * np.sin(theta1)
-        pole1_end_y = self.cart_y - self.pole_length * np.cos(theta1)
-        pole2_end_x = pole1_end_x + self.pole_length * np.sin(theta2)
-        pole2_end_y = pole1_end_y - self.pole_length * np.cos(theta2)
-
-        # Draw cart
-        pygame.draw.rect(self.screen, (0, 0, 0), [cart_x - self.cart_width / 2, self.cart_y - self.cart_height / 2, self.cart_width, self.cart_height])
-
-        # Draw first pole
-        pygame.draw.line(self.screen, (255, 0, 0), (cart_x, self.cart_y), (pole1_end_x, pole1_end_y), 5)
-
-        # Draw second pole
-        pygame.draw.line(self.screen, (0, 0, 255), (pole1_end_x, pole1_end_y), (pole2_end_x, pole2_end_y), 5)
-
-        pygame.display.flip()
-        self.clock.tick(60)
-
-    def close(self):
-        if self.screen is not None:
-            pygame.quit()
-            self.screen = None
-
-# Test the environment
 if __name__ == "__main__":
-    env = InvertedDoublePendulumEnv()
-    obs = env.reset()
-    for _ in range(1000):
-        action = env.action_space.sample()  # Random action
-        obs, reward, done, info = env.step(action)
-        env.render()
-        if done:
-            obs = env.reset()
-    env.close()
-
+    main()
